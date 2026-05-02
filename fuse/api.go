@@ -360,6 +360,13 @@ type MountOptions struct {
 	// ExtraCapabilities is a bitmask of capabilities which
 	// must be enabled in addition to the defaults.
 	ExtraCapabilities uint64
+
+	// Backend selects the macOS mount mechanism. "" (default) uses the
+	// legacy macFUSE kext path via mount_macfuse. "fskit" uses macFUSE
+	// 5.2+ FSKit mount via MFMount.framework, which requires macOS 15.4+
+	// and the macFUSE FSKit extension to be registered and approved.
+	// On non-darwin builds, a non-empty value is rejected by NewServer.
+	Backend string
 }
 
 // RawFileSystem is an interface close to the FUSE wire protocol.

@@ -167,6 +167,9 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			MaxBackground: _DEFAULT_BACKGROUND_TASKS,
 		}
 	}
+	if err := validateBackend(runtime.GOOS, opts.Backend); err != nil {
+		return nil, err
+	}
 	o := *opts
 	if o.Logger == nil {
 		o.Logger = log.Default()
@@ -223,6 +226,9 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders:   maxReaders,
 		singleReader: useSingleReader,
 		ready:        make(chan error, 1),
+	}
+	if o.Backend == "fskit" {
+		ms.protocolServer.fskit = newFSKitAdapter()
 	}
 
 	ms.protocolServer.writev = ms.writev
@@ -370,11 +376,22 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	dest := destIface.([]byte)
 
 	var n int
-	err := handleEINTR(func() error {
-		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
-		return err
-	})
+	var err error
+	if ms.fskit != nil {
+		// FSKit delivers requests over an AF_UNIX SOCK_STREAM socket,
+		// so message boundaries must be reconstructed from header.len
+		// instead of relying on one read() == one message.
+		n, err = readFramedFUSEMessage(ms.mountFd, dest)
+		if err == nil && n >= fuseInHeaderSize {
+			ms.fskit.handleInbound(dest[:n])
+		}
+	} else {
+		err = handleEINTR(func() error {
+			var rerr error
+			n, rerr = syscall.Read(ms.mountFd, dest)
+			return rerr
+		})
+	}
 	if err != nil {
 		code = ToStatus(err)
 		ms.reqPool.Put(reqIface)
@@ -952,6 +969,12 @@ func (ms *Server) WaitMount() error {
 	if parseFuseFd(ms.mountPoint) >= 0 {
 		// Magic `/dev/fd/N` mountpoint. We don't know the real mountpoint, so
 		// we cannot run the poll hack.
+		return nil
+	}
+	if ms.fskit != nil {
+		// pollHack is a workaround for the legacy macFUSE kext's poll()
+		// behavior; the FSKit transport does not have that bug, and the
+		// hack's open(".go-fuse-epoll-hack") returns EIO under FSKit.
 		return nil
 	}
 	return pollHack(ms.mountPoint)

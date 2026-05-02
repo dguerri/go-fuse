@@ -136,7 +136,15 @@ func (b *rawBridge) newInodeUnlocked(ops InodeEmbedder, id StableAttr, persisten
 		id.Mode = fuse.S_IFREG
 	}
 
+	fskit := b.options.Backend == "fskit"
+
 	if id.Ino == 0 {
+		if fskit {
+			// FSKit mode requires the filesystem to publish a non-zero Ino
+			// for every node, because FSKit addresses each file on the wire
+			// by its Ino. See go-fuse/fuse/mount_darwin_fskit.md.
+			log.Panicf("FSKit mode: filesystem returned Ino==0 (every node must publish a non-zero Ino)")
+		}
 		// Find free inode number.
 		for {
 			id.Ino = b.automaticIno
@@ -148,8 +156,22 @@ func (b *rawBridge) newInodeUnlocked(ops InodeEmbedder, id StableAttr, persisten
 		}
 	}
 
-	initInode(ops.embed(), ops, id, b, persistent, b.nextNodeId)
-	b.nextNodeId++
+	var nodeId uint64
+	if fskit {
+		if id.Ino == fuse.FUSE_ROOT_ID {
+			// Only the root may have Ino==FUSE_ROOT_ID (1) in FSKit mode.
+			// The root is initialized directly from NewNodeFS, not via
+			// newInodeUnlocked, so seeing Ino==1 here means the filesystem
+			// returned 1 for a non-root node.
+			log.Panicf("FSKit mode: filesystem returned Ino==FUSE_ROOT_ID (%d) for a non-root node", fuse.FUSE_ROOT_ID)
+		}
+		nodeId = id.Ino
+	} else {
+		nodeId = b.nextNodeId
+		b.nextNodeId++
+	}
+
+	initInode(ops.embed(), ops, id, b, persistent, nodeId)
 	return ops.embed()
 }
 
@@ -317,16 +339,31 @@ func NewNodeFS(root InodeEmbedder, opts *Options) fuse.RawFileSystem {
 		stableAttr.Gen = opts.RootStableAttr.Gen
 	}
 
+	// Under FSKit, the macFUSE shim addresses the volume root as nodeid==0
+	// (FSKit's volume-root sentinel) and only recognizes nodeid==0 for the
+	// root on outbound notifications. Mint the root with nodeId==0 so the
+	// bridge's EntryNotify/InodeNotify wire frames carry the id FSKit
+	// expects, and alias kernelNodeIds[FUSE_ROOT_ID] to the same root so
+	// inbound ops arriving with the canonical id still resolve. Classic
+	// FUSE keeps the FUSE_ROOT_ID convention. See
+	// go-fuse/fuse/mount_darwin_fskit.md.
+	rootNodeId := uint64(fuse.FUSE_ROOT_ID)
+	if opts.Backend == "fskit" {
+		rootNodeId = 0
+	}
 	initInode(root.embed(), root,
 		stableAttr,
 		bridge,
 		false,
-		1,
+		rootNodeId,
 	)
 	bridge.root = root.embed()
 	bridge.root.lookupCount = 1
 	bridge.kernelNodeIds = map[uint64]*Inode{
-		1: bridge.root,
+		fuse.FUSE_ROOT_ID: bridge.root,
+	}
+	if rootNodeId != fuse.FUSE_ROOT_ID {
+		bridge.kernelNodeIds[rootNodeId] = bridge.root
 	}
 
 	// Fh 0 means no file handle.
@@ -361,7 +398,12 @@ func (b *rawBridge) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name s
 	child, errno := b.lookup(ctx, parent, name, out)
 
 	if errno != 0 {
-		if errno == syscall.ENOENT && b.options.NegativeTimeout != nil && out.EntryTimeout() == 0 {
+		// FSKit reads Attr.Ino==0 as "this is the volume root", so the
+		// FUSE convention of returning a successful LOOKUP reply with
+		// NodeId==0 to cache a negative entry steers FSKit's follow-up
+		// ops at the parent. Skip negative caching in FSKit mode and
+		// return ENOENT instead. See go-fuse/fuse/mount_darwin_fskit.md.
+		if errno == syscall.ENOENT && b.options.NegativeTimeout != nil && out.EntryTimeout() == 0 && b.options.Backend != "fskit" {
 			out.SetEntryTimeout(*b.options.NegativeTimeout)
 			errno = 0
 		}
@@ -1077,14 +1119,33 @@ func (n *Inode) childrenAsDirstream() DirStream {
 }
 
 func (b *rawBridge) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	return b.readDirMaybeLookup(cancel, input, out, true)
+	return b.readDirMaybeLookup(cancel, input, out, true, false)
 }
 
 func (b *rawBridge) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	return b.readDirMaybeLookup(cancel, input, out, false)
+	// In FSKit mode the bridge must register a child inode for every dirent
+	// so FSKit's follow-up GETATTRs (addressed by Ino) can resolve. Promoting
+	// READDIR → READDIRPLUS at the wire was the previous approach but trips a
+	// macFUSE FSKit shim bug that doubles dirents in the userspace listing.
+	// Instead, run Lookup per entry server-side while keeping the on-wire
+	// reply in plain dirent shape.
+	if b.options.Backend == "fskit" {
+		return b.readDirMaybeLookup(cancel, input, out, true, true)
+	}
+	return b.readDirMaybeLookup(cancel, input, out, false, false)
 }
 
-func (b *rawBridge) readDirMaybeLookup(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList, lookup bool) fuse.Status {
+// readDirMaybeLookup serves READDIR/READDIRPLUS. The lookup parameter controls
+// whether the bridge runs Lookup per entry (registering child inodes); the
+// plainShape parameter controls the on-wire shape. Combinations:
+//
+//	lookup=false, plainShape=true:  classic READDIR        (no Lookup, plain dirent on wire)
+//	lookup=true,  plainShape=false: classic READDIRPLUS    (Lookup populates EntryOut on wire)
+//	lookup=true,  plainShape=true:  FSKit READDIR variant  (Lookup runs, EntryOut discarded, plain dirent on wire)
+//
+// The fourth combination (lookup=false, plainShape=false) is meaningless and
+// not used.
+func (b *rawBridge) readDirMaybeLookup(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList, lookup bool, plainShape bool) fuse.Status {
 	n, f := b.inode(input.NodeId, input.Fh)
 
 	direnter, ok := f.file.(FileReaddirenter)
@@ -1184,13 +1245,32 @@ func (b *rawBridge) readDirMaybeLookup(cancel <-chan struct{}, input *fuse.ReadI
 			continue
 		}
 
-		entryOut := out.AddDirLookupEntry(*de)
-		if entryOut == nil {
-			f.overflow = *de
-			f.hasOverflow = true
-			return fuse.OK
+		// lookup is true: register the child inode by calling Lookup. The
+		// on-wire shape depends on plainShape:
+		//   plainShape=false → AddDirLookupEntry reserves an EntryOut on the
+		//     wire payload and Lookup populates it (classic READDIRPLUS).
+		//   plainShape=true  → AddDirEntry produces a plain dirent and we
+		//     pass Lookup a stack-local EntryOut whose contents are discarded
+		//     (FSKit READDIR variant — see ReadDir).
+		var entryOut *fuse.EntryOut
+		if plainShape {
+			if !out.AddDirEntry(*de) {
+				f.overflow = *de
+				f.hasOverflow = true
+				return fuse.OK
+			}
+			f.lastRead = append(f.lastRead, *de)
+			var discardedEntryOut fuse.EntryOut
+			entryOut = &discardedEntryOut
+		} else {
+			entryOut = out.AddDirLookupEntry(*de)
+			if entryOut == nil {
+				f.overflow = *de
+				f.hasOverflow = true
+				return fuse.OK
+			}
+			f.lastRead = append(f.lastRead, *de)
 		}
-		f.lastRead = append(f.lastRead, *de)
 
 		// Virtual entries "." and ".." should be part of the
 		// directory listing, but not part of the filesystem tree.

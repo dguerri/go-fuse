@@ -31,6 +31,20 @@ func unixgramSocketpair() (l, r *os.File, err error) {
 // Create a FUSE FS on the specified mount point.  The returned
 // mount point is always absolute.
 func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
+	switch opts.Backend {
+	case "":
+		return mountKext(mountPoint, opts, ready)
+	case "fskit":
+		return mountFSKit(mountPoint, opts, ready, prodLoader)
+	default:
+		return -1, fmt.Errorf("MountOptions.Backend = %q is not supported (valid values: \"\", \"fskit\")", opts.Backend)
+	}
+}
+
+// mountKext is the legacy macFUSE kext mount path. It shells out to
+// /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse and
+// receives the FUSE fd over a unix socketpair via _FUSE_COMMFD.
+func mountKext(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
 	local, remote, err := unixgramSocketpair()
 	if err != nil {
 		return

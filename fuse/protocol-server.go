@@ -30,6 +30,12 @@ type protocolServer struct {
 	retrieveMu   sync.Mutex
 	retrieveNext uint64
 	retrieveTab  map[uint64]*retrieveCacheRequest // notifyUnique -> retrieve request
+
+	// fskit is set when MountOptions.Backend == "fskit" and translates
+	// between FSKit's "Attr.Ino is the per-file identifier" wire convention
+	// and standard FUSE's "EntryOut.NodeId is the per-file identifier"
+	// convention.
+	fskit *fskitAdapter
 }
 
 func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
@@ -73,6 +79,23 @@ func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
 		req.outPayload, req.status = req.readResult.Bytes(req.outPayload)
 		req.readResult.Done()
 		req.readResult = nil
+	}
+
+	if ms.fskit != nil {
+		op := req.inHeader().Opcode
+		// Mask SETXATTR errors on com.apple.* attrs so FSKit's create
+		// path is not aborted by a missing-xattr response. Runs before
+		// the .Ok() guard so a failed reply can still be rewritten.
+		if op == _OP_SETXATTR && !req.status.Ok() && ms.fskit.shouldMaskSetxattrError(req.inHeader().Unique) {
+			req.status = OK
+		}
+		// READDIR replies are generated as READDIRPLUS by the bridge
+		// (handleInbound promoted the opcode). Convert back to plain
+		// READDIR shape for FSKit. ID translation and negative-LOOKUP
+		// handling have moved to the bridge; see fs/bridge.go.
+		if req.status.Ok() && op == _OP_READDIRPLUS && ms.fskit.wasPromotedReadDir(req.inHeader().Unique) {
+			req.outPayload = ms.fskit.transformReadDirPlusReply(req.outPayload)
+		}
 	}
 
 	req.serializeHeader(req.outPayloadSize())
