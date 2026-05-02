@@ -230,6 +230,12 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			MaxBackground: _DEFAULT_BACKGROUND_TASKS,
 		}
 	}
+	// The "fskit" backend (and any future named backends) are darwin-only;
+	// reject a non-empty Backend elsewhere with a clear error rather than a
+	// confusing downstream failure.
+	if opts.Backend != "" && runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("MountOptions.Backend = %q is only supported on darwin (current GOOS: %s)", opts.Backend, runtime.GOOS)
+	}
 	o := *opts
 	o.setDefaults(fs)
 
@@ -254,6 +260,9 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		readBufBytes:  readBufBytes,
 		singleReader:  useSingleReader,
 		ready:         make(chan error, 1),
+	}
+	if o.Backend == "fskit" {
+		ms.protocolServer.fskit = newFSKitAdapter()
 	}
 
 	ms.protocolServer.writev = ms.writev
@@ -405,11 +414,22 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	dest := ms.readPool.Get().([]byte)
 
 	var n int
-	err := handleEINTR(func() error {
-		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
-		return err
-	})
+	var err error
+	if ms.fskit != nil {
+		// FSKit delivers requests over an AF_UNIX SOCK_STREAM socket,
+		// so message boundaries must be reconstructed from header.len
+		// instead of relying on one read() == one message.
+		n, err = readFramedFUSEMessage(ms.mountFd, dest)
+		if err == nil && n >= fuseInHeaderSize {
+			ms.fskit.handleInbound(dest[:n])
+		}
+	} else {
+		err = handleEINTR(func() error {
+			var rerr error
+			n, rerr = syscall.Read(ms.mountFd, dest)
+			return rerr
+		})
+	}
 	if err != nil {
 		ms.reqMu.Lock()
 		ms.putReadBuf(dest)
@@ -1024,6 +1044,12 @@ func (ms *Server) WaitMount() error {
 	if parseFuseFd(ms.mountPoint) >= 0 {
 		// Magic `/dev/fd/N` mountpoint. We don't know the real mountpoint, so
 		// we cannot run the poll hack.
+		return nil
+	}
+	if ms.fskit != nil {
+		// pollHack is a workaround for the legacy macFUSE kext's poll()
+		// behavior; the FSKit transport does not have that bug, and the
+		// hack's open(".go-fuse-epoll-hack") returns EIO under FSKit.
 		return nil
 	}
 	return pollHack(ms.mountPoint)

@@ -29,6 +29,12 @@ type protocolServer struct {
 	retrieveMu   sync.Mutex
 	retrieveNext uint64
 	retrieveTab  map[uint64]*retrieveCacheRequest // notifyUnique -> retrieve request
+
+	// fskit is set when MountOptions.Backend == "fskit" and translates
+	// between FSKit's "Attr.Ino is the per-file identifier" wire convention
+	// and standard FUSE's "EntryOut.NodeId is the per-file identifier"
+	// convention.
+	fskit *fskitAdapter
 }
 
 func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
@@ -82,6 +88,17 @@ func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
 		req.outPayload, req.status = req.readResult.Bytes(req.outPayload)
 		req.readResult.Done()
 		req.readResult = nil
+	}
+
+	if ms.fskit != nil && req.inHeader().Opcode == _OP_SETXATTR {
+		// Mask SETXATTR failures on com.apple.* attrs so FSKit's create
+		// path is not aborted by a missing-xattr response.
+		// shouldMaskSetxattrError is consulted for every SETXATTR reply so
+		// its bookkeeping entry is always cleared, even when the reply
+		// succeeded.
+		if ms.fskit.shouldMaskSetxattrError(req.inHeader().Unique) && !req.status.Ok() {
+			req.status = OK
+		}
 	}
 
 	req.serializeHeader(req.outPayloadSize())
